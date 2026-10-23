@@ -11,9 +11,62 @@ BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)
 LIB_DIR="$SCRIPT_DIR/lib"
 [ -f "$LIB_DIR/common.sh" ] || LIB_DIR="/usr/local/lib/sdns"
-[ -f "$LIB_DIR/common.sh" ] || { printf '%s\n' "缺少模块文件: $LIB_DIR/common.sh" >&2; exit 1; }
-. "$LIB_DIR/common.sh"
-. "$LIB_DIR/dns.sh"
+if [ -f "$LIB_DIR/common.sh" ] && [ -f "$LIB_DIR/dns.sh" ]; then
+    . "$LIB_DIR/common.sh"
+    . "$LIB_DIR/dns.sh"
+else
+    # Keep the historical single-file invocation usable (for example, a downloaded
+    # sdns.sh). Checkouts and installed copies use the extracted modules above.
+    log_info()  { printf "%b[INFO]%b %s\n" "$CYAN" "$NC" "$1"; }
+    log_ok()    { printf "%b[OK]%b %s\n" "$GREEN" "$NC" "$1"; }
+    log_err()   { printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$1"; }
+    log_warn()  { printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"; }
+    log_step()  { printf "\n%b>>> %s%b\n" "$BOLD$BLUE" "$1" "$NC"; }
+    detect_busybox() { command -v busybox >/dev/null 2>&1 && BB="busybox"; }
+    get_arch() {
+        case "$(uname -m)" in
+            x86_64|amd64) printf '%s\n' x86_64 ;;
+            aarch64|arm64) printf '%s\n' aarch64 ;;
+            armv7l|armv7) printf '%s\n' arm ;;
+            i386|i686) printf '%s\n' x86 ;;
+            *) return 1 ;;
+        esac
+    }
+    RESOLV_ORIG="/etc/resolv.conf.smartdns.orig"
+    RESOLV_ORIG_TYPE="/etc/resolv.conf.smartdns.orig.type"
+    RESOLV_ORIG_TARGET="/etc/resolv.conf.smartdns.orig.target"
+    backup_resolv_conf() {
+        [ -e "$RESOLV_ORIG_TYPE" ] && return 0
+        if [ -L /etc/resolv.conf ]; then
+            readlink /etc/resolv.conf > "$RESOLV_ORIG_TARGET" || return 1
+            printf '%s\n' symlink > "$RESOLV_ORIG_TYPE" || return 1
+            cat /etc/resolv.conf > "$RESOLV_ORIG" 2>/dev/null || :
+        elif [ -e /etc/resolv.conf ]; then
+            cp -p /etc/resolv.conf "$RESOLV_ORIG" || return 1
+            printf '%s\n' file > "$RESOLV_ORIG_TYPE" || return 1
+        else
+            printf '%s\n' absent > "$RESOLV_ORIG_TYPE" || return 1
+        fi
+    }
+    restore_resolv_conf() {
+        [ -f "$RESOLV_ORIG_TYPE" ] || return 1
+        case "$(cat "$RESOLV_ORIG_TYPE")" in
+            symlink)
+                [ -s "$RESOLV_ORIG_TARGET" ] || return 1
+                rm -f /etc/resolv.conf || return 1
+                ln -s "$(cat "$RESOLV_ORIG_TARGET")" /etc/resolv.conf || return 1
+                ;;
+            file)
+                [ -f "$RESOLV_ORIG" ] || return 1
+                rm -f /etc/resolv.conf || return 1
+                cp -p "$RESOLV_ORIG" /etc/resolv.conf || return 1
+                ;;
+            absent) rm -f /etc/resolv.conf || return 1 ;;
+            *) return 1 ;;
+        esac
+        rm -f "$RESOLV_ORIG" "$RESOLV_ORIG_TYPE" "$RESOLV_ORIG_TARGET"
+    }
+fi
 
 [ "$(id -u)" -ne 0 ] && { log_err "需要 root 权限"; exit 1; }
 

@@ -8,11 +8,65 @@ set +e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-log_info()  { printf "%b[INFO]%b %s\n" "$CYAN" "$NC" "$1"; }
-log_ok()    { printf "%b[OK]%b %s\n" "$GREEN" "$NC" "$1"; }
-log_err()   { printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$1"; }
-log_warn()  { printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"; }
-log_step()  { printf "\n%b>>> %s%b\n" "$BOLD$BLUE" "$1" "$NC"; }
+SCRIPT_DIR=$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)
+LIB_DIR="$SCRIPT_DIR/lib"
+[ -f "$LIB_DIR/common.sh" ] || LIB_DIR="/usr/local/lib/sdns"
+if [ -f "$LIB_DIR/common.sh" ] && [ -f "$LIB_DIR/dns.sh" ]; then
+    . "$LIB_DIR/common.sh"
+    . "$LIB_DIR/dns.sh"
+else
+    # Keep the historical single-file invocation usable (for example, a downloaded
+    # sdns.sh). Checkouts and installed copies use the extracted modules above.
+    log_info()  { printf "%b[INFO]%b %s\n" "$CYAN" "$NC" "$1"; }
+    log_ok()    { printf "%b[OK]%b %s\n" "$GREEN" "$NC" "$1"; }
+    log_err()   { printf "%b[ERROR]%b %s\n" "$RED" "$NC" "$1"; }
+    log_warn()  { printf "%b[WARN]%b %s\n" "$YELLOW" "$NC" "$1"; }
+    log_step()  { printf "\n%b>>> %s%b\n" "$BOLD$BLUE" "$1" "$NC"; }
+    detect_busybox() { command -v busybox >/dev/null 2>&1 && BB="busybox"; }
+    get_arch() {
+        case "$(uname -m)" in
+            x86_64|amd64) printf '%s\n' x86_64 ;;
+            aarch64|arm64) printf '%s\n' aarch64 ;;
+            armv7l|armv7) printf '%s\n' arm ;;
+            i386|i686) printf '%s\n' x86 ;;
+            *) return 1 ;;
+        esac
+    }
+    RESOLV_ORIG="/etc/resolv.conf.smartdns.orig"
+    RESOLV_ORIG_TYPE="/etc/resolv.conf.smartdns.orig.type"
+    RESOLV_ORIG_TARGET="/etc/resolv.conf.smartdns.orig.target"
+    backup_resolv_conf() {
+        [ -e "$RESOLV_ORIG_TYPE" ] && return 0
+        if [ -L /etc/resolv.conf ]; then
+            readlink /etc/resolv.conf > "$RESOLV_ORIG_TARGET" || return 1
+            printf '%s\n' symlink > "$RESOLV_ORIG_TYPE" || return 1
+            cat /etc/resolv.conf > "$RESOLV_ORIG" 2>/dev/null || :
+        elif [ -e /etc/resolv.conf ]; then
+            cp -p /etc/resolv.conf "$RESOLV_ORIG" || return 1
+            printf '%s\n' file > "$RESOLV_ORIG_TYPE" || return 1
+        else
+            printf '%s\n' absent > "$RESOLV_ORIG_TYPE" || return 1
+        fi
+    }
+    restore_resolv_conf() {
+        [ -f "$RESOLV_ORIG_TYPE" ] || return 1
+        case "$(cat "$RESOLV_ORIG_TYPE")" in
+            symlink)
+                [ -s "$RESOLV_ORIG_TARGET" ] || return 1
+                rm -f /etc/resolv.conf || return 1
+                ln -s "$(cat "$RESOLV_ORIG_TARGET")" /etc/resolv.conf || return 1
+                ;;
+            file)
+                [ -f "$RESOLV_ORIG" ] || return 1
+                rm -f /etc/resolv.conf || return 1
+                cp -p "$RESOLV_ORIG" /etc/resolv.conf || return 1
+                ;;
+            absent) rm -f /etc/resolv.conf || return 1 ;;
+            *) return 1 ;;
+        esac
+        rm -f "$RESOLV_ORIG" "$RESOLV_ORIG_TYPE" "$RESOLV_ORIG_TARGET"
+    }
+fi
 
 [ "$(id -u)" -ne 0 ] && { log_err "需要 root 权限"; exit 1; }
 
@@ -39,7 +93,6 @@ TEST_CONF="/tmp/smartdns-test.conf"
 TEST_LOG="/tmp/smartdns-startup-test.log"
 APT_UPDATED=false; BB=""
 
-detect_busybox() { command -v busybox >/dev/null 2>&1 && BB="busybox"; }
 
 pkg_install() {
     local pkgs="$1" max_retry="${2:-3}" attempt=1
@@ -67,12 +120,6 @@ github_download() {
     return 1
 }
 
-get_arch() {
-    case "$(uname -m)" in
-        x86_64|amd64) echo "x86_64" ;; aarch64|arm64) echo "aarch64" ;;
-        armv7l|armv7) echo "arm" ;; i386|i686) echo "x86" ;; *) echo "x86_64" ;;
-    esac
-}
 
 get_version_number() {
     local ver_output=$(timeout 3 "$1" -v 2>&1)
@@ -153,8 +200,7 @@ test_config_safe() {
     [ -x "$bin" ] || { echo "二进制不可执行: $bin" > "$TEST_LOG"; return 1; }
     [ -f "$conf" ] || { echo "配置不存在: $conf" > "$TEST_LOG"; return 1; }
 
-    pkill -x smartdns 2>/dev/null
-    sleep 1
+    # Test in an isolated foreground process; never kill the production daemon.
     sed 's/^bind .*/bind :15353/' "$conf" > "$TEST_CONF"
     timeout 10 "$bin" -f -c "$TEST_CONF" > "$TEST_LOG" 2>&1
     local rc=$?
@@ -211,9 +257,17 @@ apply_tier() {
 #==================================================
 module_detect() {
     log_step "模块0: 环境检测"
-    if [ -f /etc/alpine-release ]; then OS_TYPE="alpine"; OS_VER=$(cat /etc/alpine-release); PKG_MGR="apk"
-    elif [ -f /etc/os-release ]; then . /etc/os-release 2>/dev/null; OS_TYPE="debian"; OS_VER="${VERSION_ID:-unknown}"; PKG_MGR="apt"
-    else log_err "无法识别的系统"; exit 1; fi
+    if [ -f /etc/alpine-release ]; then
+        OS_TYPE="alpine"; OS_VER=$(cat /etc/alpine-release); PKG_MGR="apk"
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release 2>/dev/null
+        case "${ID:-}" in
+            debian|ubuntu|linuxmint) OS_TYPE="${ID}"; OS_VER="${VERSION_ID:-unknown}"; PKG_MGR="apt" ;;
+            *) log_err "暂不支持的发行版: ${ID:-unknown}（仅支持 Alpine/Debian/Ubuntu 系）"; exit 1 ;;
+        esac
+    else
+        log_err "无法识别的系统"; exit 1
+    fi
     log_info "系统: $OS_TYPE $OS_VER"
 
     PID1=$(cat /proc/1/comm 2>/dev/null)
@@ -229,7 +283,7 @@ module_detect() {
     case "$VIRT_TYPE" in podman|docker|lxc) VIRT_IS_CONTAINER=true ;; *) VIRT_IS_CONTAINER=false ;; esac
     log_info "虚拟化: $VIRT_TYPE (容器: $VIRT_IS_CONTAINER)"
 
-    ARCH=$(get_arch)
+    ARCH=$(get_arch) || { log_err "不支持的 CPU 架构: $(uname -m)"; exit 1; }
     ensure_system_dns
     ensure_tools
 
@@ -372,11 +426,10 @@ module_config() {
 
     PORT=53
     if port_in_use_udp 53; then
-        log_warn "UDP 53 被占用"
-        for p in 5353 5354; do
-            if ! port_in_use_udp "$p"; then PORT="$p"; log_warn "使用备用端口: $PORT"; break; fi
-        done
-    else log_ok "UDP 53 可用"; fi
+        log_err "UDP 53 仍被占用。不能改用备用端口后继续接管，因为 resolv.conf 无法指定 DNS 端口。"
+        return 1
+    fi
+    log_ok "UDP 53 可用"
 
     MODE="doh_udp"
     [ -f "$UPSTREAM_MODE_FILE" ] && MODE=$(cat "$UPSTREAM_MODE_FILE" 2>/dev/null)
@@ -397,10 +450,7 @@ module_config() {
 #==================================================
 module_dns_takeover() {
     log_step "模块3: 接管系统 DNS"
-    if [ ! -f /etc/resolv.conf.smartdns.orig ]; then
-        if [ -L /etc/resolv.conf ]; then cat /etc/resolv.conf > /etc/resolv.conf.smartdns.orig 2>/dev/null
-        else cp /etc/resolv.conf /etc/resolv.conf.smartdns.orig 2>/dev/null; fi
-    fi
+    backup_resolv_conf || { log_err "无法备份 /etc/resolv.conf，停止 DNS 接管"; return 1; }
 
     local dns_list
     dns_list=$(grep "^nameserver" "$RESOLV_TEMPLATE" 2>/dev/null | awk '{print $2}' | tr '\n' ' ' | sed 's/ $//')
@@ -640,7 +690,11 @@ module_uninstall() {
     rm -rf /etc/smartdns
     rm -f /run/smartdns.pid /run/resolv-guard.pid
 
-    [ -f /etc/resolv.conf.smartdns.orig ] && cat /etc/resolv.conf.smartdns.orig > /etc/resolv.conf && rm -f /etc/resolv.conf.smartdns.orig
+    if [ -f "$RESOLV_ORIG_TYPE" ]; then
+        restore_resolv_conf || log_warn "恢复 /etc/resolv.conf 失败，请检查 $RESOLV_ORIG*"
+    else
+        [ -f /etc/resolv.conf.smartdns.orig ] && cat /etc/resolv.conf.smartdns.orig > /etc/resolv.conf
+    fi
     [ ! -s /etc/resolv.conf ] && printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
 
     printf "%b卸载完成%b\n" "$GREEN" "$NC"
@@ -651,7 +705,11 @@ module_uninstall() {
 #==================================================
 install_shortcut() {
     local sp=$(readlink -f "$0" 2>/dev/null || echo "$0")
-    [ "$sp" != "$SDNS_CMD" ] && { cp "$sp" "$SDNS_CMD" 2>/dev/null; chmod +x "$SDNS_CMD" 2>/dev/null; }
+    if [ "$sp" != "$SDNS_CMD" ]; then
+        cp "$sp" "$SDNS_CMD" 2>/dev/null && chmod +x "$SDNS_CMD" 2>/dev/null
+        mkdir -p /usr/local/lib/sdns 2>/dev/null
+        cp "$LIB_DIR/common.sh" "$LIB_DIR/dns.sh" /usr/local/lib/sdns/ 2>/dev/null
+    fi
 }
 
 CACHE_TIME=0; CACHE_S=""
@@ -900,7 +958,7 @@ main() {
 
     printf "%bSmartDNS v7.9.7%b\n" "$BOLD$BLUE" "$NC"
     printf "菜单无效输入提示 | do_update 时序修正 | 直接拼接配置\n\n"
-    module_detect; module_install; module_config; module_dns_takeover; module_service; module_verify
+    module_detect; module_install; module_config || exit 1; module_dns_takeover || exit 1; module_service; module_verify
     module_menu
 }
 
